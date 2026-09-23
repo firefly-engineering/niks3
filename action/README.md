@@ -19,7 +19,7 @@ permissions:
 steps:
   - uses: actions/checkout@v5
   - uses: DeterminateSystems/determinate-nix-action@v3 # install Nix first
-  - uses: firefly-engineering/niks3/action@v1.12.0-firefly.2
+  - uses: firefly-engineering/niks3/action@v1.12.0-firefly.3
     with:
       server-url: https://cache.example.com
       netrc-login: ci
@@ -53,12 +53,16 @@ cache rejects it.
 
 When the job has `id-token: write` and `skip-push` is not set, the action
 authenticates with GitHub OIDC, for the audience the server reports for
-GitHub's issuer. It starts an upload daemon and registers a `post-build-hook`,
+GitHub's issuer. It logs the token's `iss`, `sub` and `aud`, and fails the step
+if the server refuses that token for writes: the server's 401 gives no reason,
+so compare those claims with its rules. It then starts an upload daemon and registers a `post-build-hook`,
 so every derivation the job builds is uploaded as soon as it finishes,
 intermediate ones included (module downloads, vendored trees), even if the build
 later fails. Paths the job substitutes are not uploaded. Each built path is
 uploaded with its runtime closure, and the server skips what it already has. A
-post-job step drains the queue.
+post-job step drains the queue and fails the job if any built path was not
+uploaded, printing the counts, the last server error and the upload daemon's
+log. Upload attempts that fail but succeed on retry only warn.
 
 Jobs without `id-token: write`, such as fork PRs, only get the substituter.
 
@@ -75,7 +79,7 @@ Jobs without `id-token: write`, such as fork PRs, only get the substituter.
 | `cache-config-timeout` | no | seconds before each /api/cache-config request times out (default 15) |
 | `cache-config-retries` | no | extra attempts to fetch /api/cache-config after a transient failure (default 3) |
 | `drain-timeout` | no | seconds to wait for uploads to finish in the post step (default 600) |
-| `niks3-bin` | no | path to a niks3 binary (with `niks3-hook` beside it), instead of downloading the release |
+| `niks3-bin` | no | path to a niks3 binary (with a `niks3-hook` of the same release beside it), instead of downloading the release |
 | `debug` | no | enable debug logging |
 
 ## Development
@@ -93,4 +97,5 @@ into `dist/index.cjs` at bundle time. To release, set it to the new tag, run
 `npm run build`, commit, then push the tag; the release workflow refuses a tag
 that differs from it. `.github/workflows/action.yml` runs the action on a real
 runner against a private niks3 started by [`test/fixture.sh`](test/fixture.sh),
-on Determinate and upstream Nix.
+on Determinate and upstream Nix, and checks that a server refusing the job's
+token turns the job red.

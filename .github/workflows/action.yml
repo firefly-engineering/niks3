@@ -56,7 +56,7 @@ jobs:
         uses: cachix/install-nix-action@v31
       - name: Start the private cache
         id: fixture
-        run: action/test/fixture.sh "$RUNNER_TEMP/fixture" "$LOGIN" "$PASSWORD" >>"$GITHUB_OUTPUT"
+        run: action/test/fixture.sh start "$RUNNER_TEMP/fixture" "$LOGIN" "$PASSWORD" >>"$GITHUB_OUTPUT"
       - uses: ./action
         with:
           server-url: ${{ steps.fixture.outputs.url }}
@@ -116,3 +116,69 @@ jobs:
             echo "::group::$f"; tail -n 200 "$f"; echo "::endgroup::"
           done
           if [[ -f /etc/determinate/config.json ]]; then sudo cat /etc/determinate/config.json; fi
+  # A server that refuses the job's token must turn the job red. It once
+  # answered 401 to every upload of a real run (a write rule bound to a
+  # subject form GitHub no longer issued for that repository), and all the
+  # action said was that its upload daemon had drained.
+  e2e-rejected:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      LOGIN: e2e
+      PASSWORD: e2e-password
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Start the private cache
+        id: fixture
+        run: action/test/fixture.sh start "$RUNNER_TEMP/fixture" "$LOGIN" "$PASSWORD" >>"$GITHUB_OUTPUT"
+      # Driven through test/run-action.mjs, because the post step is
+      # expected to fail and would otherwise fail this job.
+      - name: Uploads rejected after setup fail the post step
+        env:
+          URL: ${{ steps.fixture.outputs.url }}
+          BIN: ${{ steps.fixture.outputs.bin }}
+        run: |
+          state=$RUNNER_TEMP/action-state
+          inputs=(server-url="$URL" netrc-login="$LOGIN" netrc-password="$PASSWORD" niks3-bin="$BIN/niks3" drain-timeout=120 skip-push=false debug=false)
+          node action/test/run-action.mjs main "$state" "${inputs[@]}"
+          # The rule the token matched at setup no longer does when it uploads.
+          action/test/fixture.sh reject-writes "$RUNNER_TEMP/fixture"
+          export NIX_USER_CONF_FILES="$RUNNER_TEMP/niks3/nix.conf:$HOME/.config/nix/nix.conf:/etc/xdg/nix/nix.conf"
+          nix-build action/test/e2e.nix --argstr seed "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-rejected" -A final --no-out-link
+          # The expected failure's ::error:: must not annotate this run.
+          token=$(openssl rand -hex 16)
+          echo "::stop-commands::$token"
+          if node action/test/run-action.mjs post "$state" "${inputs[@]}" >"$RUNNER_TEMP/post.log" 2>&1; then post=passed; else post=failed; fi
+          cat "$RUNNER_TEMP/post.log"
+          echo "::$token::"
+          if [[ $post == passed ]]; then
+            echo "::error::the post step passed although every upload was rejected"
+            exit 1
+          fi
+          grep -q 'niks3: uploads failed (2 built paths received, 0 uploaded, 2 not uploaded' "$RUNNER_TEMP/post.log"
+          grep -q 'server returned 401' "$RUNNER_TEMP/post.log"
+      - name: A rule that does not match the token fails setup
+        id: setup
+        continue-on-error: true
+        uses: ./action
+        with:
+          server-url: ${{ steps.fixture.outputs.url }}
+          netrc-login: ${{ env.LOGIN }}
+          netrc-password: ${{ env.PASSWORD }}
+          niks3-bin: ${{ steps.fixture.outputs.bin }}/niks3
+      - name: Setup failed
+        if: steps.setup.outcome != 'failure'
+        run: |
+          echo "::error::setup passed although the server refuses the job's token"
+          exit 1
+      - name: Logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/fixture/*.log "$RUNNER_TEMP"/niks3/daemon.log; do
+            [[ -f $f ]] || continue
+            echo "::group::$f"; tail -n 200 "$f"; echo "::endgroup::"
+          done
