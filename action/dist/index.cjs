@@ -22998,6 +22998,7 @@ async function setup() {
   if (cfg.netrc) await configureNetrc(workDir, cfg);
   const mode = await pickMode(cfg);
   info(`Push mode: ${mode}`);
+  if (mode !== "none") await preflightWrite(workDir, cfg);
   switch (mode) {
     case "daemon":
       await startDaemon(binDir, workDir, cfg);
@@ -23286,6 +23287,37 @@ function isTrustedUser() {
   }
   return trusted.includes(username) || trusted.includes("*");
 }
+async function preflightWrite(workDir, cfg) {
+  const script = writeTokenScript(workDir, cfg.audience);
+  const [cmd, ...args] = script.split(" ");
+  const { token } = JSON.parse((0, import_node_child_process.execFileSync)(cmd, args, { encoding: "utf8", timeout: 3e4 }));
+  const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+  const who = `iss=${claims.iss} sub=${claims.sub} aud=${claims.aud}`;
+  info(`OIDC token: ${who}`);
+  let res;
+  try {
+    res = await fetch(new URL("/api/objects/present", cfg.serverURL), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ keys: [] }),
+      signal: AbortSignal.timeout(15e3)
+    });
+  } catch (err) {
+    warning(`could not check write access against ${cfg.serverURL}: ${err}`);
+    return;
+  }
+  if (res.ok) {
+    info("Server accepts this token for writes");
+    return;
+  }
+  const body = (await res.text()).trim();
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(
+      `${cfg.serverURL} refused this job's OIDC token for writes (HTTP ${res.status}: ${body}). Token: ${who}. The server's OIDC rules must match these claims; set skip-push: true for jobs that should not write.`
+    );
+  }
+  warning(`write access check against ${cfg.serverURL} returned HTTP ${res.status}: ${body}`);
+}
 async function startDaemon(binDir, workDir, cfg) {
   const hookBin = path5.join(binDir, "niks3-hook");
   const socket = socketPath(workDir);
@@ -23298,6 +23330,7 @@ exec ${q(hookBin)} send --socket ${q(socket)}
 `);
   const dbPath = path5.join(workDir, "queue.db");
   const logPath = path5.join(workDir, "daemon.log");
+  const statsPath = path5.join(workDir, "stats.json");
   const logFD = fs4.openSync(logPath, "w");
   const args = [
     "serve",
@@ -23310,7 +23343,9 @@ exec ${q(hookBin)} send --socket ${q(socket)}
     "--auth-token-script",
     tokenScript,
     "--idle-exit-timeout",
-    "0"
+    "0",
+    "--stats-file",
+    statsPath
   ];
   if (cfg.debug) args.push("--debug");
   fs4.accessSync(hookBin, fs4.constants.X_OK);
@@ -23335,6 +23370,7 @@ exec ${q(hookBin)} send --socket ${q(socket)}
   info(`niks3-hook serve started (pid ${child2.pid}, socket ${socket})`);
   saveState("daemonPid", String(child2.pid));
   saveState("daemonLog", logPath);
+  saveState("daemonStats", statsPath);
 }
 function writeTokenScript(workDir, audience) {
   const reqURL = process.env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "";
@@ -23392,14 +23428,17 @@ async function stopDaemon() {
   try {
     process.kill(pid, "SIGTERM");
   } catch {
-    return;
   }
   const deadline = Date.now() + timeoutSec * 1e3;
   let lastBeat = Date.now();
-  while (Date.now() < deadline) {
-    if (!alive(pid)) {
-      notice("niks3: upload daemon drained");
-      return;
+  while (alive(pid)) {
+    if (Date.now() > deadline) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+      }
+      dumpLog(logPath);
+      throw new Error(`niks3: upload daemon did not drain within ${timeoutSec}s; killed it`);
     }
     if (Date.now() - lastBeat > 3e4) {
       info("waiting for upload daemon to drain...");
@@ -23407,11 +23446,37 @@ async function stopDaemon() {
     }
     await sleep(500);
   }
-  warning(`niks3-hook daemon did not drain within ${timeoutSec}s; killing (log: ${logPath})`);
+  reportUploads(getState("daemonStats"), logPath);
+}
+function reportUploads(statsPath, logPath) {
+  let stats;
   try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
+    stats = JSON.parse(fs4.readFileSync(statsPath, "utf8"));
+  } catch (err) {
+    dumpLog(logPath);
+    throw new Error(`niks3: upload daemon exited without writing ${statsPath}: ${err}`);
   }
+  const summary2 = `${stats.received} built paths received, ${stats.pushed} uploaded, ${stats.remaining} not uploaded`;
+  const lastError = stats.last_error ? `; last error: ${stats.last_error.trim()}` : "";
+  if (stats.remaining !== 0 || stats.received > 0 && stats.pushed === 0) {
+    dumpLog(logPath);
+    throw new Error(`niks3: uploads failed (${summary2}, ${stats.failed} failed attempts${lastError})`);
+  }
+  if (stats.failed > 0) {
+    warning(`niks3: ${stats.failed} upload attempts failed before succeeding on retry${lastError}`);
+  }
+  notice(`niks3: ${summary2}`);
+}
+function dumpLog(logPath) {
+  let lines;
+  try {
+    lines = fs4.readFileSync(logPath, "utf8").trimEnd().split("\n");
+  } catch {
+    return;
+  }
+  startGroup(`niks3-hook daemon log (last 200 of ${lines.length} lines)`);
+  info(lines.slice(-200).join("\n"));
+  endGroup();
 }
 function alive(pid) {
   try {
@@ -23457,10 +23522,8 @@ function pushStoreDiff() {
     if (getState("debug") === "true") args.push("--debug");
     args.push(...added);
     const r = (0, import_node_child_process.spawnSync)(path5.join(binDir, "niks3"), args, { stdio: "inherit" });
-    if (r.status !== 0) throw new Error(`niks3 push exited ${r.status}`);
+    if (r.status !== 0) throw new Error(`niks3: push of ${added.length} paths exited ${r.status}`);
     notice(`niks3: pushed ${added.length} paths`);
-  } catch (err) {
-    warning(`niks3: storescan push failed: ${err}`);
   } finally {
     endGroup();
   }
@@ -23472,23 +23535,23 @@ async function resolveBinDir() {
     return path5.dirname(override);
   }
   const plat = platformTuple();
-  const cached = find("niks3", "v1.12.0-firefly.2", plat);
+  const cached = find("niks3", "v1.12.0-firefly.3", plat);
   if (cached) {
-    info(`Found cached niks3 ${"v1.12.0-firefly.2"} (${plat})`);
+    info(`Found cached niks3 ${"v1.12.0-firefly.3"} (${plat})`);
     return cached;
   }
-  const base = `https://github.com/${RELEASE_REPO}/releases/download/${"v1.12.0-firefly.2"}`;
+  const base = `https://github.com/${RELEASE_REPO}/releases/download/${"v1.12.0-firefly.3"}`;
   const archive = `niks3_${plat}.tar.gz`;
-  info(`Downloading niks3 ${"v1.12.0-firefly.2"} from ${base}/${archive}`);
+  info(`Downloading niks3 ${"v1.12.0-firefly.3"} from ${base}/${archive}`);
   const tarball = await downloadTool(`${base}/${archive}`);
   const checksums = fs4.readFileSync(await downloadTool(`${base}/checksums.txt`), "utf8");
   verifyChecksum(tarball, archive, checksums);
   const extracted = await extractTar(tarball);
-  return cacheDir(extracted, "niks3", "v1.12.0-firefly.2", plat);
+  return cacheDir(extracted, "niks3", "v1.12.0-firefly.3", plat);
 }
 function verifyChecksum(file, name, checksums) {
   const entry = checksums.split("\n").map((l) => l.trim().split(/\s+/)).find((fields) => fields.length === 2 && fields[1] === name);
-  if (!entry) throw new Error(`checksums.txt of ${"v1.12.0-firefly.2"} has no entry for ${name}`);
+  if (!entry) throw new Error(`checksums.txt of ${"v1.12.0-firefly.3"} has no entry for ${name}`);
   const actual = (0, import_node_crypto.createHash)("sha256").update(fs4.readFileSync(file)).digest("hex");
   if (actual !== entry[0]) {
     throw new Error(`checksum mismatch for ${name}: expected ${entry[0]}, got ${actual}`);
@@ -23507,11 +23570,7 @@ function q(s) {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 main().catch((err) => {
-  if (isPost) {
-    warning(`post step failed: ${err.message}`);
-  } else {
-    setFailed(err.message);
-  }
+  setFailed(err.message);
 });
 /*! Bundled license information:
 

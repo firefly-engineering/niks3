@@ -62,6 +62,8 @@ func printServeHelp() {
 	fmt.Fprintln(os.Stderr, "        Give up draining the queue on shutdown after this long (default: 0, unbounded)")
 	fmt.Fprintln(os.Stderr, "  --max-concurrent-uploads int")
 	fmt.Fprintln(os.Stderr, "        Concurrent upload limit (default: 30)")
+	fmt.Fprintln(os.Stderr, "  --stats-file string")
+	fmt.Fprintln(os.Stderr, "        On exit, write received/pushed/failed/remaining path counts and the last upload error here as JSON")
 	fmt.Fprintln(os.Stderr, "  --verify-s3-integrity")
 	fmt.Fprintln(os.Stderr, "        Verify S3 objects before skipping")
 	fmt.Fprintln(os.Stderr, cmdutil.TLSHelp)
@@ -141,6 +143,7 @@ func runServe() error {
 	drainTimeout := fs.Duration("drain-timeout", 0, "Give up draining on shutdown after this long; 0 = unbounded")
 	maxConcurrent := fs.Int("max-concurrent-uploads", 30, "Concurrent upload limit")
 	verifyS3 := fs.Bool("verify-s3-integrity", false, "Verify S3 integrity")
+	statsFile := fs.String("stats-file", "", "Write upload counts as JSON here on exit")
 	tf := cmdutil.AddTLSFlags(fs)
 
 	ts, err := cmdutil.ParseCommand(fs, cf, tf, os.Args[2:], printServeHelp)
@@ -193,10 +196,14 @@ func runServe() error {
 	idleNotify := make(chan struct{}, 1)
 
 	// QueueFunc: enqueue paths in SQLite and notify worker + idle timer.
+	var stats hook.Stats
+
 	queueFunc := func(paths []string) error {
 		if err := queue.Enqueue(paths); err != nil {
 			return fmt.Errorf("enqueueing paths: %w", err)
 		}
+
+		stats.AddReceived(len(paths))
 		// Non-blocking sends to wake both consumers.
 		select {
 		case workerNotify <- struct{}{}:
@@ -234,7 +241,7 @@ func runServe() error {
 	)
 
 	// Start the upload worker.
-	worker := hook.NewWorker(queue, c.PushPaths, *batchSize, workerNotify)
+	worker := hook.NewWorker(queue, stats.WrapPush(c.PushPaths), *batchSize, workerNotify)
 	worker.DrainTimeout = *drainTimeout
 	workerDone := make(chan struct{})
 
@@ -292,6 +299,17 @@ func runServe() error {
 	// Wait for worker to finish draining.
 	workerCancel()
 	<-workerDone
+
+	if *statsFile != "" {
+		remaining, err := queue.Count()
+		if err != nil {
+			remaining = -1
+		}
+
+		if err := stats.WriteFile(*statsFile, remaining); err != nil {
+			slog.Error("Failed to write stats file", "error", err)
+		}
+	}
 
 	slog.Info("niks3-hook serve stopped")
 
