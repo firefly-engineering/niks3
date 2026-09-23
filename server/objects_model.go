@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/Mic92/niks3/server/pg"
 	"github.com/minio/minio-go/v7"
@@ -132,6 +133,74 @@ func handleFailedObject(ctx context.Context, objectName string, resultErr error,
 	return failedKeys, s3Errors, nil
 }
 
+// unansweredKeys tracks the keys handed to RemoveObjectsWithResult that have
+// not produced a result yet.
+//
+// minio-go does not answer for every key: on endpoints without multi-object
+// delete (Google Cloud Storage) it deletes one key at a time and skips a key
+// whose DELETE answers NoSuchKey without yielding anything. Such a key is
+// already gone, and its row must still be dropped, or every later GC run
+// hands it out again.
+type unansweredKeys struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+func (u *unansweredKeys) add(key string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.keys[key] = struct{}{}
+}
+
+func (u *unansweredKeys) answered(key string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	delete(u.keys, key)
+}
+
+func (u *unansweredKeys) remaining() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	keys := make([]string, 0, len(u.keys))
+	for key := range u.keys {
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+// trackUnanswered forwards objectCh, recording every key it passes on.
+func trackUnanswered(ctx context.Context, objectCh <-chan minio.ObjectInfo, unanswered *unansweredKeys) <-chan minio.ObjectInfo {
+	out := make(chan minio.ObjectInfo)
+
+	go func() {
+		defer close(out)
+
+		for obj := range objectCh {
+			unanswered.add(obj.Key)
+
+			select {
+			case out <- obj:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out
+}
+
+// isAbsent reports whether key is confirmed missing from the bucket. Any
+// other outcome, including an error, is not a confirmation.
+func (s *Service) isAbsent(ctx context.Context, key string) bool {
+	_, err := s.MinioClient.StatObject(ctx, s.Bucket, key, minio.StatObjectOptions{})
+
+	return err != nil && minio.ToErrorResponse(err).Code == minio.NoSuchKey
+}
+
 func (s *Service) removeS3Objects(ctx context.Context,
 	objectCh <-chan minio.ObjectInfo,
 	stats *ObjectCleanupStats,
@@ -151,7 +220,12 @@ func (s *Service) removeS3Objects(ctx context.Context,
 
 	var s3Errors, batchErrors []error
 
-	for result := range s.MinioClient.RemoveObjectsWithResult(ctx, s.Bucket, objectCh, opts) {
+	unanswered := &unansweredKeys{keys: map[string]struct{}{}}
+	trackedCh := trackUnanswered(ctx, objectCh, unanswered)
+
+	for result := range s.MinioClient.RemoveObjectsWithResult(ctx, s.Bucket, trackedCh, opts) {
+		unanswered.answered(result.ObjectName)
+
 		switch {
 		case result.Err == nil:
 			s.S3RateLimiter.RecordSuccess()
@@ -184,6 +258,27 @@ func (s *Service) removeS3Objects(ctx context.Context,
 		var err error
 
 		deletedKeys, err = handleDeletedObject(ctx, result.ObjectName, deletedKeys, queries)
+		if err != nil {
+			batchErrors = append(batchErrors, err)
+		}
+
+		stats.DeletedCount++
+		notifyProgress()
+	}
+
+	// Keys minio-go said nothing about: drop the row of each one the bucket
+	// confirms is gone. A key that cannot be confirmed keeps its row as it
+	// is, and the next run hands it out again.
+	for _, key := range unanswered.remaining() {
+		if !s.isAbsent(ctx, key) {
+			slog.Warn("object deletion produced no result and the object could not be confirmed absent", "object", key)
+
+			continue
+		}
+
+		var err error
+
+		deletedKeys, err = handleDeletedObject(ctx, key, deletedKeys, queries)
 		if err != nil {
 			batchErrors = append(batchErrors, err)
 		}

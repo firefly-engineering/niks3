@@ -201,3 +201,52 @@ func TestGCTerminatesAgainstGoogleEndpoint(t *testing.T) {
 		t.Errorf("expected no object rows left, got %d", n)
 	}
 }
+
+// TestGCClearsRowsOfObjectsAlreadyGoneOnGoogleEndpoint covers rows whose
+// object is already absent from the bucket — deleted out of band, or by an
+// earlier run whose database flush did not happen. On a Google endpoint
+// minio-go yields no result for such a key, so unless the GC counts the
+// silence as "gone", the row survives and every later run DELETEs it again.
+func TestGCClearsRowsOfObjectsAlreadyGoneOnGoogleEndpoint(t *testing.T) {
+	t.Parallel()
+
+	service := createTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+
+	present := fmt.Sprintf("%032d.narinfo", 1)
+	absent := fmt.Sprintf("%032d.narinfo", 2)
+
+	transport := useGoogleEndpoint(t, service)
+
+	createOrphanedObjects(t, service, []struct {
+		key  string
+		refs []string
+	}{{key: present, refs: []string{}}})
+
+	_, err := service.Pool.Exec(ctx, "INSERT INTO objects (key, refs) VALUES ($1, '{}')", absent)
+	ok(t, err)
+
+	status := runGCWithDeadline(t, service, 30*time.Second)
+
+	if status.State != api.GCTaskStateSucceeded {
+		t.Fatalf("gc ended in state %s: %s", status.State, status.Error)
+	}
+
+	if status.Stats.ObjectsDeletedAfterGracePeriod != 2 || status.Stats.ObjectsFailedToDelete != 0 {
+		t.Errorf("expected 2 deleted and 0 failed, got %d deleted and %d failed",
+			status.Stats.ObjectsDeletedAfterGracePeriod, status.Stats.ObjectsFailedToDelete)
+	}
+
+	counts := transport.deleteCounts()
+	for _, key := range []string{present, absent} {
+		if counts[key] != 1 {
+			t.Errorf("key %s: expected 1 DELETE, got %d", key, counts[key])
+		}
+	}
+
+	if n := countObjectRows(t, service); n != 0 {
+		t.Errorf("expected no object rows left, got %d", n)
+	}
+}
