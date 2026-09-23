@@ -9,7 +9,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # action/ downloads the niks3 release named in action/NIKS3_VERSION, so a
+  # tag must match it or `uses: .../action@<tag>` would fetch another release.
+  action-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches action/NIKS3_VERSION
+        run: |
+          pinned=$(cat action/NIKS3_VERSION)
+          if [[ "$pinned" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME, but action/NIKS3_VERSION is $pinned. Bump it and rebuild action/dist before tagging."
+            exit 1
+          fi
   goreleaser:
+    needs: action-version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,6 +40,23 @@ jobs:
         run: nix shell --inputs-from . nixpkgs#goreleaser --command goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # The released action, as a consumer runs it: downloads this release's
+  # client and verifies it against checksums.txt.
+  action-smoke:
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: ./action
+        with:
+          server-url: https://cache.arbora.partners
+          skip-push: true
+      - name: The client of this release is installed
+        run: |
+          ls "$RUNNER_TOOL_CACHE/niks3/${GITHUB_REF_NAME#v}"/*/niks3 "$RUNNER_TOOL_CACHE/niks3/${GITHUB_REF_NAME#v}"/*/niks3-hook
   helm-chart:
     runs-on: ubuntu-latest
     permissions:

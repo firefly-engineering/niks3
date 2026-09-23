@@ -1,0 +1,118 @@
+name: Action
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dist-fresh:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: action
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: action/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Verify dist/ is up to date
+        run: |
+          if [[ -n "$(git status --porcelain dist/)" ]]; then
+            echo "::error::action/dist is stale. Run 'npm run build' in action/ and commit the result."
+            git diff dist/
+            exit 1
+          fi
+  # Runs the action against a private niks3 started on the runner, laid out
+  # like a production deployment (see test/fixture.sh): writes with this
+  # job's OIDC token, reads through HTTP Basic auth.
+  e2e:
+    # Fork PRs get no OIDC token, so nothing would be pushed.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        nix: [determinate, upstream]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      LOGIN: e2e
+      PASSWORD: e2e-password
+    steps:
+      - uses: actions/checkout@v5
+      - if: matrix.nix == 'determinate'
+        uses: DeterminateSystems/determinate-nix-action@v3
+      - if: matrix.nix == 'upstream'
+        uses: cachix/install-nix-action@v31
+      - name: Start the private cache
+        id: fixture
+        run: action/test/fixture.sh "$RUNNER_TEMP/fixture" "$LOGIN" "$PASSWORD" >>"$GITHUB_OUTPUT"
+      - uses: ./action
+        with:
+          server-url: ${{ steps.fixture.outputs.url }}
+          netrc-login: ${{ env.LOGIN }}
+          netrc-password: ${{ env.PASSWORD }}
+          niks3-bin: ${{ steps.fixture.outputs.bin }}/niks3
+          debug: true
+      - name: Build, and substitute a path from cache.nixos.org
+        id: build
+        run: |
+          seed="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.nix }}"
+          final=$(nix-build action/test/e2e.nix --argstr seed "$seed" -A final --no-out-link)
+          intermediate=$(nix eval --raw -f action/test/e2e.nix --argstr seed "$seed" intermediate.outPath)
+          substituted=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#hello)
+          printf '%s\n' "$final" "$intermediate" >"$RUNNER_TEMP/built-paths"
+          {
+            echo "final=$final"
+            echo "intermediate=$intermediate"
+            echo "substituted=$substituted"
+          } >>"$GITHUB_OUTPUT"
+      - name: What the job built is uploaded, what it substituted is not
+        env:
+          URL: ${{ steps.fixture.outputs.url }}
+          FINAL: ${{ steps.build.outputs.final }}
+          INTERMEDIATE: ${{ steps.build.outputs.intermediate }}
+          SUBSTITUTED: ${{ steps.build.outputs.substituted }}
+        run: |
+          narinfo() { curl -sf -u "$LOGIN:$PASSWORD" "$URL/$(basename "$1" | cut -c1-32).narinfo" >/dev/null; }
+          for p in "$FINAL" "$INTERMEDIATE"; do
+            for _ in $(seq 60); do narinfo "$p" && break; sleep 2; done
+            narinfo "$p" || { echo "::error::$p was not uploaded"; exit 1; }
+            echo "uploaded: $p"
+          done
+          if narinfo "$SUBSTITUTED"; then
+            echo "::error::$SUBSTITUTED was substituted, yet uploaded"
+            exit 1
+          fi
+          echo "not uploaded: $SUBSTITUTED"
+      - name: The daemon substitutes through the Basic-auth front
+        run: |
+          # Read from a file, not the step's env: Nix counts
+          # /proc/<pid>/environ as a GC root.
+          mapfile -t paths <"$RUNNER_TEMP/built-paths"
+          nix store delete "${paths[@]}" || { nix-store --query --roots "${paths[@]}"; exit 1; }
+          # The build looked these up before they were uploaded; skip the
+          # cached misses.
+          nix-store --realise "${paths[@]}" --option narinfo-cache-negative-ttl 0
+          for p in "${paths[@]}"; do
+            nix path-info --sigs "$p" | grep -q niks3-e2e-1: || { echo "::error::$p was not substituted from the cache"; exit 1; }
+          done
+          echo "authenticated 200s at the front: $(grep -c '"status":200' "$RUNNER_TEMP/fixture/caddy-access.log" || true)"
+      - name: Logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/fixture/*.log "$RUNNER_TEMP"/niks3/daemon.log /etc/nix/nix.conf /etc/nix/nix.custom.conf; do
+            [[ -f $f ]] || continue
+            echo "::group::$f"; tail -n 200 "$f"; echo "::endgroup::"
+          done
+          if [[ -f /etc/determinate/config.json ]]; then sudo cat /etc/determinate/config.json; fi

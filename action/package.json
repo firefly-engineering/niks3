@@ -1,0 +1,18 @@
+{
+  "name": "niks3-action",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --define:NIKS3_VERSION=\\\"$(cat NIKS3_VERSION)\\\" --outfile=dist/index.cjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/tool-cache": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^6.0.3"
+  }
+}

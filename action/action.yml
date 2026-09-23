@@ -1,0 +1,55 @@
+name: niks3 binary cache
+description: Pull from and push Nix build outputs to a niks3 binary cache with per-derivation caching
+author: firefly-engineering (forked from Mic92/niks3-action)
+branding:
+  icon: database
+  color: blue
+inputs:
+  server-url:
+    description: >-
+      niks3 server URL (e.g. https://niks3.example.com). The action fetches substituter URL, public keys, and OIDC audience from this server's /api/cache-config endpoint unless overridden below.
+    required: true
+  substituter:
+    description: >-
+      Override the substituter URL written to nix.conf. Defaults to the server's configured cache-url.
+    required: false
+  netrc-login:
+    description: >-
+      Login for HTTP Basic auth on the substituter's read path. Set together with netrc-password; the action writes a `machine <substituter host> login .. password ..` netrc entry and makes the Nix daemon use it.
+    required: false
+  netrc-password:
+    description: >-
+      Password for netrc-login. Pass it from a secret.
+    required: false
+  netrc:
+    description: >-
+      netrc entries verbatim (e.g. `machine cache.example.com login ci password ...`), instead of netrc-login/netrc-password. Pass it from a secret.
+    required: false
+  skip-push:
+    description: >-
+      Only configure the substituter; do not push build outputs.
+    default: 'false'
+  niks3-bin:
+    description: >-
+      Path to a niks3 binary. Defaults to downloading niks3 from the release of this repo the action is tagged with, verified against its checksums.txt.
+    required: false
+  cache-config-timeout:
+    description: >-
+      Seconds to wait for each /api/cache-config request before timing out.
+    default: '15'
+  cache-config-retries:
+    description: >-
+      Number of additional attempts to fetch /api/cache-config after a transient failure (network error, timeout, or 5xx).
+    default: '3'
+  drain-timeout:
+    description: >-
+      Seconds to wait for the upload daemon to drain in the post step.
+    default: '600'
+  debug:
+    description: >-
+      Enable debug logging.
+    default: 'false'
+runs:
+  using: node24
+  main: dist/index.cjs
+  post: dist/index.cjs
