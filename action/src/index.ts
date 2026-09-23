@@ -73,6 +73,8 @@ async function setup(): Promise<void> {
   const mode = await pickMode(cfg)
   core.info(`Push mode: ${mode}`)
 
+  if (mode !== 'none') await preflightWrite(workDir, cfg)
+
   switch (mode) {
     case 'daemon':
       await startDaemon(binDir, workDir, cfg)
@@ -444,6 +446,52 @@ function isTrustedUser(): boolean {
   return trusted.includes(username) || trusted.includes('*')
 }
 
+// preflightWrite mints this job's OIDC token with the same script the
+// uploader uses and asks the server to authorize a write with it, so a token
+// no rule accepts fails the job here, before anything is built, instead of
+// every upload being rejected in the background. The token's claims are
+// logged because the server's 401 names no reason: the mismatch is visible
+// only by comparing iss/sub/aud with the server's rules.
+async function preflightWrite(workDir: string, cfg: ResolvedConfig): Promise<void> {
+  const script = writeTokenScript(workDir, cfg.audience)
+  const [cmd, ...args] = script.split(' ')
+  const { token } = JSON.parse(execFileSync(cmd, args, { encoding: 'utf8', timeout: 30000 })) as {
+    token: string
+  }
+  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()) as Record<
+    string,
+    unknown
+  >
+  const who = `iss=${claims.iss} sub=${claims.sub} aud=${claims.aud}`
+  core.info(`OIDC token: ${who}`)
+
+  let res: Response
+  try {
+    res = await fetch(new URL('/api/objects/present', cfg.serverURL), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: [] }),
+      signal: AbortSignal.timeout(15000),
+    })
+  } catch (err) {
+    core.warning(`could not check write access against ${cfg.serverURL}: ${err}`)
+    return
+  }
+  if (res.ok) {
+    core.info('Server accepts this token for writes')
+    return
+  }
+  const body = (await res.text()).trim()
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(
+      `${cfg.serverURL} refused this job's OIDC token for writes (HTTP ${res.status}: ${body}). ` +
+        `Token: ${who}. The server's OIDC rules must match these claims; ` +
+        `set skip-push: true for jobs that should not write.`,
+    )
+  }
+  core.warning(`write access check against ${cfg.serverURL} returned HTTP ${res.status}: ${body}`)
+}
+
 // startDaemon writes the post-build-hook shim, the OIDC token script, and
 // forks `niks3-hook serve` detached in its own process group so the runner's
 // step-end cleanup doesn't take it down early.
@@ -462,6 +510,7 @@ async function startDaemon(binDir: string, workDir: string, cfg: ResolvedConfig)
 
   const dbPath = path.join(workDir, 'queue.db')
   const logPath = path.join(workDir, 'daemon.log')
+  const statsPath = path.join(workDir, 'stats.json')
   const logFD = fs.openSync(logPath, 'w')
 
   const args = [
@@ -471,6 +520,7 @@ async function startDaemon(binDir: string, workDir: string, cfg: ResolvedConfig)
     '--server-url', cfg.serverURL,
     '--auth-token-script', tokenScript,
     '--idle-exit-timeout', '0',
+    '--stats-file', statsPath,
   ]
   if (cfg.debug) args.push('--debug')
 
@@ -502,6 +552,7 @@ async function startDaemon(binDir: string, workDir: string, cfg: ResolvedConfig)
   core.info(`niks3-hook serve started (pid ${child.pid}, socket ${socket})`)
   core.saveState('daemonPid', String(child.pid))
   core.saveState('daemonLog', logPath)
+  core.saveState('daemonStats', statsPath)
 }
 
 // writeTokenScript drops a self-contained node script that prints
@@ -577,7 +628,8 @@ async function post(): Promise<void> {
   }
 }
 
-// stopDaemon SIGTERMs the niks3-hook daemon and waits for it to drain.
+// stopDaemon SIGTERMs the niks3-hook daemon, waits for it to drain, and
+// fails the job unless everything the hook handed it reached the server.
 async function stopDaemon(): Promise<void> {
   const pid = parseInt(core.getState('daemonPid') || '0', 10)
   if (!pid) {
@@ -591,16 +643,20 @@ async function stopDaemon(): Promise<void> {
   try {
     process.kill(pid, 'SIGTERM')
   } catch {
-    // Already dead.
-    return
+    // Already dead; its stats file (or lack of one) tells what happened.
   }
 
   const deadline = Date.now() + timeoutSec * 1000
   let lastBeat = Date.now()
-  while (Date.now() < deadline) {
-    if (!alive(pid)) {
-      core.notice('niks3: upload daemon drained')
-      return
+  while (alive(pid)) {
+    if (Date.now() > deadline) {
+      try {
+        process.kill(-pid, 'SIGKILL') // negative pid = process group
+      } catch {
+        /* already gone */
+      }
+      dumpLog(logPath)
+      throw new Error(`niks3: upload daemon did not drain within ${timeoutSec}s; killed it`)
     }
     // Heartbeat so the runner's no-output watchdog doesn't kill the job.
     if (Date.now() - lastBeat > 30000) {
@@ -610,12 +666,51 @@ async function stopDaemon(): Promise<void> {
     await sleep(500)
   }
 
-  core.warning(`niks3-hook daemon did not drain within ${timeoutSec}s; killing (log: ${logPath})`)
+  reportUploads(core.getState('daemonStats'), logPath)
+}
+
+interface DaemonStats {
+  received: number
+  pushed: number
+  failed: number
+  remaining: number
+  last_error?: string
+}
+
+// reportUploads turns the daemon's stats file into the step's outcome: a
+// notice when every built path was uploaded, a failure when any is left in
+// the queue or none went up, so rejected uploads cannot pass silently.
+function reportUploads(statsPath: string, logPath: string): void {
+  let stats: DaemonStats
   try {
-    process.kill(-pid, 'SIGKILL') // negative pid = process group
-  } catch {
-    /* already gone */
+    stats = JSON.parse(fs.readFileSync(statsPath, 'utf8')) as DaemonStats
+  } catch (err) {
+    dumpLog(logPath)
+    throw new Error(`niks3: upload daemon exited without writing ${statsPath}: ${err}`)
   }
+
+  const summary = `${stats.received} built paths received, ${stats.pushed} uploaded, ${stats.remaining} not uploaded`
+  const lastError = stats.last_error ? `; last error: ${stats.last_error.trim()}` : ''
+  if (stats.remaining !== 0 || (stats.received > 0 && stats.pushed === 0)) {
+    dumpLog(logPath)
+    throw new Error(`niks3: uploads failed (${summary}, ${stats.failed} failed attempts${lastError})`)
+  }
+  if (stats.failed > 0) {
+    core.warning(`niks3: ${stats.failed} upload attempts failed before succeeding on retry${lastError}`)
+  }
+  core.notice(`niks3: ${summary}`)
+}
+
+function dumpLog(logPath: string): void {
+  let lines: string[]
+  try {
+    lines = fs.readFileSync(logPath, 'utf8').trimEnd().split('\n')
+  } catch {
+    return
+  }
+  core.startGroup(`niks3-hook daemon log (last 200 of ${lines.length} lines)`)
+  core.info(lines.slice(-200).join('\n'))
+  core.endGroup()
 }
 
 // alive reports whether pid is still running. kill(pid, 0) alone is
@@ -675,10 +770,8 @@ function pushStoreDiff(): void {
     args.push(...added)
 
     const r = spawnSync(path.join(binDir, 'niks3'), args, { stdio: 'inherit' })
-    if (r.status !== 0) throw new Error(`niks3 push exited ${r.status}`)
+    if (r.status !== 0) throw new Error(`niks3: push of ${added.length} paths exited ${r.status}`)
     core.notice(`niks3: pushed ${added.length} paths`)
-  } catch (err) {
-    core.warning(`niks3: storescan push failed: ${err}`)
   } finally {
     core.endGroup()
   }
@@ -746,9 +839,5 @@ function q(s: string): string {
 }
 
 main().catch((err: Error) => {
-  if (isPost) {
-    core.warning(`post step failed: ${err.message}`)
-  } else {
-    core.setFailed(err.message)
-  }
+  core.setFailed(err.message)
 })
