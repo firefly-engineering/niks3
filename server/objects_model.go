@@ -62,10 +62,17 @@ func (s *Service) getObjectsForDeletion(ctx context.Context,
 		onProgress(*stats)
 	}
 
-	// Then, get objects ready for deletion (marked > gracePeriod ago)
+	// Then, get objects ready for deletion (marked > gracePeriod ago).
+	// Rows stay in this result set until removeS3Objects flushes them, which
+	// may be long after they were handed out, so page by key: re-querying
+	// from the start would hand the same keys out again, and on a backend
+	// that reports nothing for an already-deleted key they would never flush.
+	afterKey := ""
+
 	for {
 		objs, err := queries.GetObjectsReadyForDeletion(ctx, pg.GetObjectsReadyForDeletionParams{
 			GracePeriodSeconds: gracePeriod,
+			AfterKey:           afterKey,
 			LimitCount:         DeletionBatchSize,
 		})
 		if err != nil {
@@ -78,6 +85,8 @@ func (s *Service) getObjectsForDeletion(ctx context.Context,
 		if len(objs) == 0 {
 			break
 		}
+
+		afterKey = objs[len(objs)-1]
 
 		for _, obj := range objs {
 			select {
