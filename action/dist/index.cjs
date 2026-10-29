@@ -23535,23 +23535,23 @@ async function resolveBinDir() {
     return path5.dirname(override);
   }
   const plat = platformTuple();
-  const cached = find("niks3", "v1.12.0-firefly.3", plat);
+  const cached = find("niks3", "v1.15.0-firefly.1", plat);
   if (cached) {
-    info(`Found cached niks3 ${"v1.12.0-firefly.3"} (${plat})`);
+    info(`Found cached niks3 ${"v1.15.0-firefly.1"} (${plat})`);
     return cached;
   }
-  const base = `https://github.com/${RELEASE_REPO}/releases/download/${"v1.12.0-firefly.3"}`;
+  const base = `https://github.com/${RELEASE_REPO}/releases/download/${"v1.15.0-firefly.1"}`;
   const archive = `niks3_${plat}.tar.gz`;
-  info(`Downloading niks3 ${"v1.12.0-firefly.3"} from ${base}/${archive}`);
+  info(`Downloading niks3 ${"v1.15.0-firefly.1"} from ${base}/${archive}`);
   const tarball = await downloadTool(`${base}/${archive}`);
   const checksums = fs4.readFileSync(await downloadTool(`${base}/checksums.txt`), "utf8");
   verifyChecksum(tarball, archive, checksums);
   const extracted = await extractTar(tarball);
-  return cacheDir(extracted, "niks3", "v1.12.0-firefly.3", plat);
+  return cacheDir(extracted, "niks3", "v1.15.0-firefly.1", plat);
 }
 function verifyChecksum(file, name, checksums) {
   const entry = checksums.split("\n").map((l) => l.trim().split(/\s+/)).find((fields) => fields.length === 2 && fields[1] === name);
-  if (!entry) throw new Error(`checksums.txt of ${"v1.12.0-firefly.3"} has no entry for ${name}`);
+  if (!entry) throw new Error(`checksums.txt of ${"v1.15.0-firefly.1"} has no entry for ${name}`);
   const actual = (0, import_node_crypto.createHash)("sha256").update(fs4.readFileSync(file)).digest("hex");
   if (actual !== entry[0]) {
     throw new Error(`checksum mismatch for ${name}: expected ${entry[0]}, got ${actual}`);
