@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Mic92/niks3/api"
 )
 
 // GetStoreDir determines the Nix store directory path.
@@ -302,7 +304,7 @@ func GetStorePathHash(storePath string) (string, error) {
 
 	// Validate hash charset (Nix base32: 0-9 and a-z except e,o,t,u)
 	for i, ch := range hash {
-		if !strings.ContainsRune(nixBase32Alphabet, ch) {
+		if !strings.ContainsRune(api.NixBase32Alphabet, ch) {
 			return "", fmt.Errorf("invalid character %q at position %d in hash: %s", ch, i, storePath)
 		}
 	}

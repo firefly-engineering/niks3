@@ -239,3 +239,44 @@ func TestSignErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyNarinfo(t *testing.T) {
+	t.Parallel()
+
+	key, err := signing.ParseKey("test-1:0knWkx/F+6IJmI4dkvNs14SCaewg9ZWSAQUNg9juRxh/8x+rzUJx9SWdyGOVl21IbJlQemUKG40qW2TTyrE++w==")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pubStr, err := key.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pub, err := signing.ParsePublicKey(pubStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info := &signing.NarInfo{
+		StorePath: "/nix/store/26xbg1ndr7hbcncrlf9nhx5is2b25d13-hello",
+		NarHash:   "sha256:1ngi2dxw1f7khrrjamzkkdai393lwcm8s78gvs1ag8k3n82w7bvp",
+		NarSize:   42,
+	}
+
+	signed, err := key.Sign(t.Context(), map[string]*signing.NarInfo{"hello": info})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sigs := []string{signed["hello"]}
+
+	if !pub.VerifyNarinfo(info, sigs) {
+		t.Error("valid signature rejected")
+	}
+
+	info.NarSize = 43
+	if pub.VerifyNarinfo(info, sigs) {
+		t.Error("signature accepted for a changed narinfo")
+	}
+}

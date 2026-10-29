@@ -53,6 +53,35 @@ presigned S3 URL instead of being streamed, so NAR bytes bypass niks3. Narinfos
 and other metadata stay proxied. Note that anyone holding such a URL can fetch
 that object until it expires, regardless of read-proxy authentication.
 
+### Upstream caches (optional)
+
+The read proxy can fill misses from other binary caches, so clients configure
+niks3 alone:
+
+```
+--upstream-cache 'https://example.cachix.org example.cachix.org-1:base64key='
+```
+
+Repeat the flag for more upstreams; they are tried in order. On a narinfo miss
+niks3 fetches the upstream narinfo and accepts it only with a valid signature
+by that upstream's key. It then downloads the NAR and checks its hash and size.
+It stores both, registers the path as a push of that one path would (so GC
+treats it the same), and re-signs the narinfo with its own keys. References
+fill on demand, as the client asks for each one. Paths over `--max-nar-size`
+are not fetched. A path no upstream has is remembered as a miss for a minute.
+NARs must be uncompressed, zstd or bzip2; xz is not supported yet.
+
+Configure only upstreams you trust as fully as your own pushes: niks3's
+signature becomes the only one clients check. Fills need authenticated reads,
+so anonymous requests can't grow the cache. niks3 refuses to start with
+upstreams unless it authenticates reads itself (`--mtls-bound-subject-read` or
+an OIDC read scope), or `--reads-gated-by-proxy` asserts that a reverse proxy
+in front authenticates every read (e.g. HTTP Basic auth).
+
+A fill finishes before the narinfo is answered. If a big NAR takes longer
+than the client waits, the client falls back, and the fill completes in the
+background for the next request.
+
 ## Features
 
 ### Binary Cache Protocol Support

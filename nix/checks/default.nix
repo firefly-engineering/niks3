@@ -113,6 +113,9 @@ packages
     niks3 = selfPackages.niks3;
     niks3-openbao-signer = selfPackages.niks3-openbao-signer;
   };
+  nixos-test-upstream = pkgs.callPackage ./nixos-test-upstream.nix {
+    rustfs = pkgs.rustfs;
+  };
   nixos-test-k3s = pkgs.callPackage ./nixos-test-k3s.nix {
     inherit common;
     inherit (selfPackages) niks3 niks3-docker;

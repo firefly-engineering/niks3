@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mic92/niks3/api"
 	"github.com/klauspost/compress/zstd"
 	minio "github.com/minio/minio-go/v7"
 )
@@ -148,19 +149,15 @@ var zstdDecoderPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool should b
 	},
 }
 
-// Nix base32 alphabet: 0123456789abcdfghijklmnpqrsvwxyz
-// (note: no 'e', 't', 'u' — differs from standard base32).
-const nixBase32Alphabet = "0123456789abcdfghijklmnpqrsvwxyz"
-
 var (
 	// narinfo: {32-char nix-base32 hash}.narinfo
-	narinfoRe = regexp.MustCompile(`^[` + nixBase32Alphabet + `]{32}\.narinfo$`)
+	narinfoRe = regexp.MustCompile(`^[` + api.NixBase32Alphabet + `]{32}\.narinfo$`)
 
 	// nar: nar/{52-char nix-base32 hash}.nar[.zst|.xz|.bz2]
-	narRe = regexp.MustCompile(`^nar/[` + nixBase32Alphabet + `]{52}\.nar(\.zst|\.xz|\.bz2)?$`)
+	narRe = regexp.MustCompile(`^nar/[` + api.NixBase32Alphabet + `]{52}\.nar(\.zst|\.xz|\.bz2)?$`)
 
 	// ls: {32-char nix-base32 hash}.ls
-	lsRe = regexp.MustCompile(`^[` + nixBase32Alphabet + `]{32}\.ls$`)
+	lsRe = regexp.MustCompile(`^[` + api.NixBase32Alphabet + `]{32}\.ls$`)
 
 	// log: log/{name}.drv — name alphabet matches nix's nameRegexStr
 	// in src/libstore/path.cc: [A-Za-z0-9+\-._?=].
@@ -262,6 +259,17 @@ func (s *Service) ReadProxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 
 		return
+	}
+
+	if narinfoRe.MatchString(key) && s.mayFillFromUpstream(r) {
+		// A fill streams a whole NAR before the narinfo can be answered.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(upstreamFillTimeout + proxyTimeoutSlack)); err != nil {
+			slog.Debug("Failed to extend write deadline", "key", key, "error", err)
+		}
+
+		if err := s.fillFromUpstream(r.Context(), key); err != nil {
+			slog.Error("Upstream fill failed", "key", key, "error", err)
+		}
 	}
 
 	if r.Method == http.MethodHead {

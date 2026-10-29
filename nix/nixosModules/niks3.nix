@@ -252,6 +252,11 @@ let
     "--read-redirect-ttl"
     cfg.readProxy.redirectTTL
   ]
+  ++ lib.concatMap (u: [
+    "--upstream-cache"
+    "${u.url} ${u.publicKey}"
+  ]) cfg.readProxy.upstreams
+  ++ lib.optional cfg.readProxy.gatedByProxy "--reads-gated-by-proxy"
   ++ lib.optionals (cfg.cacheUrl != null) [
     "--cache-url"
     cfg.cacheUrl
@@ -557,6 +562,44 @@ in
           Redirect NAR reads to presigned S3 URLs valid for this long instead
           of streaming them through niks3. Anyone holding such a URL can fetch
           the object until it expires.
+        '';
+      };
+
+      upstreams = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              url = lib.mkOption {
+                type = lib.types.str;
+                example = "https://example.cachix.org";
+                description = "Base URL of the upstream binary cache.";
+              };
+              publicKey = lib.mkOption {
+                type = lib.types.str;
+                example = "example.cachix.org-1:base64key=";
+                description = "Public key the upstream's narinfos must be signed with.";
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = ''
+          Binary caches to fill misses from, tried in order. A path pulled from
+          an upstream is checked against that upstream's key, stored, and
+          re-signed with signKeyFiles, so clients only need niks3's key.
+          Configure only upstreams trusted as fully as your own pushes. Fills
+          need authenticated reads: a read rule in niks3, or gatedByProxy.
+        '';
+      };
+
+      gatedByProxy = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Assert that a reverse proxy authenticates every read (e.g. HTTP
+          Basic auth), so reads niks3 itself sees as anonymous may fill from
+          upstreams. Leave false if the niks3 port is reachable without that
+          proxy.
         '';
       };
     };

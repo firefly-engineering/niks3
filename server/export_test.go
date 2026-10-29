@@ -136,3 +136,9 @@ func (s *Service) SetTestHookBeforeRedundantAbort(f func()) {
 func (s *Service) SetTestHookBeforeProxyGet(f func()) {
 	s.testHookBeforeProxyGet = f
 }
+
+// UpstreamNarinfo exposes the parsed form of an upstream narinfo to tests.
+type UpstreamNarinfo = upstreamNarinfo
+
+// ParseNarinfoForTest is an export of parseNarinfo for tests.
+func ParseNarinfoForTest(text string) (*UpstreamNarinfo, error) { return parseNarinfo(text) }

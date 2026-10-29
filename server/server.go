@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"golang.org/x/sync/singleflight"
 )
 
 type options struct {
@@ -64,6 +65,13 @@ type options struct {
 
 	// CachePriority is advertised in nix-cache-info. Lower wins.
 	CachePriority int
+
+	// Upstreams are binary caches the read proxy fills misses from.
+	Upstreams []Upstream
+
+	// ReadsGatedByProxy asserts a reverse proxy authenticates every read,
+	// so reads niks3 itself sees as anonymous may fill from Upstreams.
+	ReadsGatedByProxy bool
 
 	// MTLSProxyHeader, when set, names a header the reverse proxy sets to
 	MTLSProxySocket string
@@ -131,6 +139,13 @@ type Service struct {
 	// CachePriority is written to nix-cache-info. 0 means defaultCachePriority.
 	CachePriority int
 
+	// See options.Upstreams and options.ReadsGatedByProxy.
+	Upstreams         []Upstream
+	ReadsGatedByProxy bool
+
+	upstreamFills  singleflight.Group
+	upstreamMisses upstreamMisses
+
 	// NativeMTLS is set when the server terminates TLS itself with a
 	// client CA — mtlsCheck reads r.TLS.PeerCertificates directly
 	// instead of trusting proxy headers.
@@ -162,6 +177,8 @@ func (s *Service) Close() {
 }
 
 const (
+	schemeHTTPS = "https"
+
 	dbConnectionTimeout = 10 * time.Second
 
 	// shutdownTimeout bounds how long we wait for in-flight requests to
@@ -183,7 +200,7 @@ func NewPresignClient(
 	lookup minio.BucketLookupType,
 ) (*minio.Client, error) {
 	u, err := url.Parse(publicURL)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") {
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != schemeHTTPS) || (u.Path != "" && u.Path != "/") {
 		return nil, fmt.Errorf("invalid S3 public URL %q: expected http(s)://host[:port]", publicURL)
 	}
 
@@ -311,6 +328,10 @@ func runServer(opts *options) error {
 
 		service.SigningKeys = append(service.SigningKeys, signer)
 		slog.Info("Configured external signer", "program", opts.SignProgram)
+	}
+
+	if err := service.configureUpstreams(opts); err != nil {
+		return err
 	}
 
 	// Initialize the bucket with nix-cache-info if it doesn't exist

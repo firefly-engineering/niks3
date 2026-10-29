@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/Mic92/niks3/api"
 	"github.com/Mic92/niks3/client"
 )
 
@@ -42,9 +43,9 @@ func TestEncodeNixBase32(t *testing.T) {
 				}
 			}
 
-			result := client.EncodeNixBase32(input)
+			result := api.EncodeNixBase32(input)
 			if result != tt.expected {
-				t.Errorf("client.EncodeNixBase32() = %q, want %q", result, tt.expected)
+				t.Errorf("api.EncodeNixBase32() = %q, want %q", result, tt.expected)
 			}
 		})
 	}
@@ -57,11 +58,11 @@ func TestEncodeNixBase32WithRealHash(t *testing.T) {
 	input := []byte("test")
 	hash := sha256.Sum256(input)
 
-	result := client.EncodeNixBase32(hash[:])
+	result := api.EncodeNixBase32(hash[:])
 	expected := "020ay2q1av2xs4n842rb3d7vz8qms1dcb87a5yd6azaci20x11lz"
 
 	if result != expected {
-		t.Errorf("client.EncodeNixBase32(sha256(test)) = %q, want %q", result, expected)
+		t.Errorf("api.EncodeNixBase32(sha256(test)) = %q, want %q", result, expected)
 	}
 }
 

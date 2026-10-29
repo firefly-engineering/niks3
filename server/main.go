@@ -176,6 +176,25 @@ func validateTLSOptions(opts *options) error {
 	return nil
 }
 
+func registerUpstreamFlags(opts *options) {
+	flag.Var((*upstreamsFlag)(&opts.Upstreams), "upstream-cache",
+		"Binary cache to fill read-proxy misses from, as \"<cache-url> <public-key>\". Its narinfos must carry a valid "+
+			"signature by that key; pulled paths are re-signed with niks3's keys. Repeat for more; tried in order")
+	flag.BoolVar(&opts.ReadsGatedByProxy, "reads-gated-by-proxy",
+		getEnvOrDefaultBool("NIKS3_READS_GATED_BY_PROXY", false),
+		"Assert that a reverse proxy authenticates every read, so reads niks3 sees as anonymous may fill from "+
+			"--upstream-cache. Without it only reads niks3 authenticated itself (mTLS or OIDC read rule) fill")
+}
+
+// validateReadProxy checks the options that only work with the read proxy.
+func validateReadProxy(opts *options) error {
+	if len(opts.Upstreams) > 0 && !opts.EnableReadProxy {
+		return errors.New("--upstream-cache requires --enable-read-proxy")
+	}
+
+	return validateReadRedirect(opts)
+}
+
 func parseArgs() (*options, error) {
 	var opts options
 
@@ -250,6 +269,7 @@ func parseArgs() (*options, error) {
 		getEnvOrDefaultDuration("NIKS3_READ_REDIRECT_TTL", 0),
 		"Answer NAR reads with a redirect to a presigned S3 URL valid for this long (e.g. 15m) instead of "+
 			"streaming them. Requires --enable-read-proxy. 0 disables")
+	registerUpstreamFlags(&opts)
 	flag.BoolVar(&opts.Debug, "debug", getEnvOrDefaultBool("NIKS3_DEBUG", false),
 		"Enable debug logging (may leak sensitive information)")
 
@@ -348,7 +368,7 @@ func parseArgs() (*options, error) {
 		return nil, errors.New("--s3-concurrency must be at least 1")
 	}
 
-	if err := validateReadRedirect(&opts); err != nil {
+	if err := validateReadProxy(&opts); err != nil {
 		return nil, err
 	}
 
