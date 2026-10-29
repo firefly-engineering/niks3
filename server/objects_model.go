@@ -68,7 +68,11 @@ func (s *Service) sweepBatch(ctx context.Context, gracePeriod int32, afterKey st
 		s3Errs  []error
 	)
 
+	answered := make(map[string]bool, len(unpending))
+
 	for result := range s.MinioClient.RemoveObjectsWithResult(ctx, s.Bucket, objectCh, minio.RemoveObjectsOptions{}) {
+		answered[result.ObjectName] = true
+
 		switch {
 		case result.Err == nil:
 			s.S3RateLimiter.RecordSuccess()
@@ -87,6 +91,24 @@ func (s *Service) sweepBatch(ctx context.Context, gracePeriod int32, afterKey st
 		}
 
 		deleted = append(deleted, result.ObjectName)
+	}
+
+	// minio-go yields nothing for a key whose DELETE answers NoSuchKey on an
+	// endpoint without multi-object delete (Google Cloud Storage). Drop the
+	// row of each such key the bucket confirms is gone; one that can't be
+	// confirmed keeps its tombstone for the next run.
+	for _, key := range unpending {
+		if answered[key] {
+			continue
+		}
+
+		if !s.isAbsent(ctx, key) {
+			slog.Warn("object deletion produced no result and the object could not be confirmed absent", "object", key)
+
+			continue
+		}
+
+		deleted = append(deleted, key)
 	}
 
 	if err := pg.New(tx).DeleteObjects(ctx, deleted); err != nil {
@@ -148,4 +170,12 @@ func (s *Service) cleanupOrphanObjects(ctx context.Context, gracePeriod int32, o
 	}
 
 	return stats, nil
+}
+
+// isAbsent reports whether key is confirmed missing from the bucket. Any
+// other outcome, including an error, is not a confirmation.
+func (s *Service) isAbsent(ctx context.Context, key string) bool {
+	_, err := s.MinioClient.StatObject(ctx, s.Bucket, key, minio.StatObjectOptions{})
+
+	return err != nil && minio.ToErrorResponse(err).Code == minio.NoSuchKey
 }
